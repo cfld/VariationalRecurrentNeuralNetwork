@@ -22,7 +22,7 @@ def train(epoch):
 		#data = Variable(data)
 		#to remove eventually
 		data = Variable(data.squeeze().transpose(0, 1))
-		data = (data - data.min().data[0]) / (data.max().data[0] - data.min().data[0])
+		data = (data - data.min().item()) / (data.max().item() - data.min().item())
 		
 		#forward + backward + optimize
 		optimizer.zero_grad()
@@ -62,11 +62,11 @@ def test(epoch):
 		
 		#data = Variable(data)
 		data = Variable(data.squeeze().transpose(0, 1))
-		data = (data - data.min().data[0]) / (data.max().data[0] - data.min().data[0])
+		data = (data - data.min().item()) / (data.max().item() - data.min().item())
 
 		kld_loss, nll_loss, _, _ = model(data)
-		mean_kld_loss += kld_loss.data[0]
-		mean_nll_loss += nll_loss.data[0]
+		mean_kld_loss += kld_loss.item()
+		mean_nll_loss += nll_loss.item()
 
 	mean_kld_loss /= len(test_loader.dataset)
 	mean_nll_loss /= len(test_loader.dataset)
