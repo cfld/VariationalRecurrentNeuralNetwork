@@ -1,184 +1,174 @@
-import math
 import torch
 import torch.nn as nn
-import torch.utils
-import torch.utils.data
-from torchvision import datasets, transforms
-from torch.autograd import Variable
-import matplotlib.pyplot as plt 
+import numpy as np
 
-
-"""implementation of the Variational Recurrent
-Neural Network (VRNN) from https://arxiv.org/abs/1506.02216
-using unimodal isotropic gaussian distributions for 
-inference, prior, and generating models."""
+import torch.distributions.normal as norm
+import torch.distributions.kl as kl
+import torch.nn.functional as F
 
 
 class VRNN(nn.Module):
-	def __init__(self, x_dim, h_dim, z_dim, n_layers, bias=False):
-		super(VRNN, self).__init__()
+
+	def __init__(self, x_dim, h_dim, z_dim):
+		super(VRNN,self).__init__()
 
 		self.x_dim = x_dim
 		self.h_dim = h_dim
 		self.z_dim = z_dim
-		self.n_layers = n_layers
 
-		#feature-extracting transformations
-		self.phi_x = nn.Sequential(
+		# feature extractors of x 4 hidden layer w relu
+		self.x_fx = nn.Sequential(
 			nn.Linear(x_dim, h_dim),
 			nn.ReLU(),
 			nn.Linear(h_dim, h_dim),
-			nn.ReLU())
-		self.phi_z = nn.Sequential(
+			nn.ReLU(),
+			nn.Linear(h_dim, h_dim),
+			nn.ReLU(),
+			nn.Linear(h_dim, h_dim),
+			nn.ReLU()
+		)
+
+		# feature extractor of z 4 hidden layer w relu
+		self.z_fx =  nn.Sequential(
 			nn.Linear(z_dim, h_dim),
-			nn.ReLU())
+            nn.ReLU(),
+            nn.Linear(h_dim, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, h_dim),
+            nn.ReLU()
+        )
 
-		#encoder
-		self.enc = nn.Sequential(
-			nn.Linear(h_dim + h_dim, h_dim),
+		# eq 5 (phi_prior(h_t-1) -> mu/sig)
+		self.prior_fx = nn.Sequential(
+			nn.Linear(h_dim, h_dim),
+			nn.ReLU()
+		)
+
+		self.prior_mean = nn.Sequential(
+			nn.Linear(h_dim, h_dim),
 			nn.ReLU(),
 			nn.Linear(h_dim, h_dim),
-			nn.ReLU())
-		self.enc_mean = nn.Linear(h_dim, z_dim)
-		self.enc_std = nn.Sequential(
+			nn.ReLU(),
 			nn.Linear(h_dim, z_dim),
-			nn.Softplus())
+		)
 
-		#prior
-		self.prior = nn.Sequential(
+		self.prior_var = nn.Sequential(
 			nn.Linear(h_dim, h_dim),
-			nn.ReLU())
-		self.prior_mean = nn.Linear(h_dim, z_dim)
-		self.prior_std = nn.Sequential(
-			nn.Linear(h_dim, z_dim),
-			nn.Softplus())
-
-		#decoder
-		self.dec = nn.Sequential(
-			nn.Linear(h_dim + h_dim, h_dim),
 			nn.ReLU(),
 			nn.Linear(h_dim, h_dim),
-			nn.ReLU())
-		self.dec_std = nn.Sequential(
-			nn.Linear(h_dim, x_dim),
-			nn.Softplus())
-		#self.dec_mean = nn.Linear(h_dim, x_dim)
-		self.dec_mean = nn.Sequential(
-			nn.Linear(h_dim, x_dim),
-			nn.Sigmoid())
+			nn.ReLU(),
+			nn.Linear(h_dim, z_dim),
+			nn.Softplus()
+		)
 
-		#recurrence
-		self.rnn = nn.GRU(h_dim + h_dim, h_dim, n_layers, bias)
+		# eq 6, phi_dec(phi(z), h_t-1) -> mu/sig
+		self.decoder_fx = nn.Sequential(
+			nn.Linear(h_dim * 2, h_dim),
+			nn.ReLU()
+		)
+
+		self.decoder_mean = nn.Sequential(
+			nn.Linear(h_dim, h_dim),
+			nn.ReLU(),
+			nn.Linear(h_dim, h_dim),
+			nn.ReLU(),
+			nn.Linear(h_dim, x_dim),
+			nn.Sigmoid()
+		)
+
+		self.decoder_var = nn.Sequential(
+			nn.Linear(h_dim, h_dim),
+			nn.ReLU(),
+			nn.Linear(h_dim, h_dim),
+			nn.ReLU(),
+			nn.Linear(h_dim, x_dim),
+			nn.Softplus()
+		)
+
+		# encoder phi_enc(phi_x, h) ->
+		self.encoder_fx = nn.Sequential(
+			nn.Linear(h_dim * 2, h_dim),
+			nn.ReLU()
+		)
+
+		# VRE regard mean values sampled from z as the output
+		self.encoder_mean = nn.Sequential(
+			nn.Linear(h_dim, h_dim),
+			nn.ReLU(),
+			nn.Linear(h_dim, h_dim),
+			nn.ReLU(),
+			nn.Linear(h_dim, z_dim),
+		)
+		self.encoder_var = nn.Sequential(
+			nn.Linear(h_dim, h_dim),
+			nn.ReLU(),
+			nn.Linear(h_dim, h_dim),
+			nn.ReLU(),
+			nn.Linear(h_dim, z_dim),
+			nn.Softplus()
+		)
+
+		# using the recurrence equation to update its hidden state
+		self.rnn = nn.GRUCell(h_dim * 2, h_dim)
 
 
 	def forward(self, x):
+		'''
+		:param x: shape of [frame, bs, fts dim]
+		:return:
+		'''
+		h = torch.zeros([x.shape[0], self.h_dim], device=x.device)
+		prior_mu_all, prior_sig_all     = [], []
+		encoder_mu_all, encoder_sig_all = [], []
+		decoder_mu_all, decoder_sig_all = [], []
 
-		all_enc_mean, all_enc_std = [], []
-		all_dec_mean, all_dec_std = [], []
-		kld_loss = 0
-		nll_loss = 0
+		for t in range(x.shape[1]):
 
-		h = Variable(torch.zeros(self.n_layers, x.size(1), self.h_dim))
-		for t in range(x.size(0)):
-			
-			phi_x_t = self.phi_x(x[t])
+			# extract x
+			phi_x = self.x_fx(x[:,t,:])
 
-			#encoder
-			enc_t = self.enc(torch.cat([phi_x_t, h[-1]], 1))
-			enc_mean_t = self.enc_mean(enc_t)
-			enc_std_t = self.enc_std(enc_t)
+			# priors
+			prior_ft  = self.prior_fx(h)
+			prior_mu  = self.prior_mean(prior_ft) # not used
+			prior_sig = self.prior_var(prior_ft) # not used
 
-			#prior
-			prior_t = self.prior(h[-1])
-			prior_mean_t = self.prior_mean(prior_t)
-			prior_std_t = self.prior_std(prior_t)
+			# encoder
+			encoder_ft  = self.encoder_fx(torch.cat([phi_x, h], dim=1))
+			encoder_mu  = self.encoder_mean(encoder_ft)
+			encoder_sig = self.encoder_var(encoder_ft)
 
-			#sampling and reparameterization
-			z_t = self._reparameterized_sample(enc_mean_t, enc_std_t)
-			phi_z_t = self.phi_z(z_t)
+			# decoder
+			z_sampled = self.reparam(encoder_mu, encoder_sig)
+			phi_z     = self.z_fx(z_sampled)
+			decoder_ft  = self.decoder_fx(torch.cat([phi_z, h], dim=1))
+			decoder_mu  = self.decoder_mean(decoder_ft) # not used
+			decoder_sig = self.decoder_var(decoder_ft) # not used
 
-			#decoder
-			dec_t = self.dec(torch.cat([phi_z_t, h[-1]], 1))
-			dec_mean_t = self.dec_mean(dec_t)
-			dec_std_t = self.dec_std(dec_t)
+			prior_mu_all.append(prior_mu)
+			prior_sig_all.append(prior_sig)
+			encoder_mu_all.append(encoder_mu)
+			encoder_sig_all.append(encoder_sig)
+			decoder_mu_all.append(decoder_mu)
 
-			#recurrence
-			_, h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1).unsqueeze(0), h)
+			h = self.rnn(torch.cat([phi_x, phi_z], dim=1), h)
 
-			#computing losses
-			kld_loss += self._kld_gauss(enc_mean_t, enc_std_t, prior_mean_t, prior_std_t)
-			#nll_loss += self._nll_gauss(dec_mean_t, dec_std_t, x[t])
-			nll_loss += self._nll_bernoulli(dec_mean_t, x[t])
-
-			all_enc_std.append(enc_std_t)
-			all_enc_mean.append(enc_mean_t)
-			all_dec_mean.append(dec_mean_t)
-			all_dec_std.append(dec_std_t)
-
-		return kld_loss, nll_loss, \
-			(all_enc_mean, all_enc_std), \
-			(all_dec_mean, all_dec_std)
+		return [prior_mu_all, prior_sig_all, encoder_mu_all, encoder_sig_all, decoder_mu_all]
 
 
-	def sample(self, seq_len):
 
-		sample = torch.zeros(seq_len, self.x_dim)
-
-		h = Variable(torch.zeros(self.n_layers, 1, self.h_dim))
-		for t in range(seq_len):
-
-			#prior
-			prior_t = self.prior(h[-1])
-			prior_mean_t = self.prior_mean(prior_t)
-			prior_std_t = self.prior_std(prior_t)
-
-			#sampling and reparameterization
-			z_t = self._reparameterized_sample(prior_mean_t, prior_std_t)
-			phi_z_t = self.phi_z(z_t)
-			
-			#decoder
-			dec_t = self.dec(torch.cat([phi_z_t, h[-1]], 1))
-			dec_mean_t = self.dec_mean(dec_t)
-			#dec_std_t = self.dec_std(dec_t)
-
-			phi_x_t = self.phi_x(dec_mean_t)
-
-			#recurrence
-			_, h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1).unsqueeze(0), h)
-
-			sample[t] = dec_mean_t.data
-	
-		return sample
+	def reparam(self, mu, var):
+		epsilon = torch.rand_like(mu, device=mu.device)
+		return mu+var*epsilon
 
 
-	def reset_parameters(self, stdv=1e-1):
-		for weight in self.parameters():
-			weight.data.normal_(0, stdv)
 
 
-	def _init_weights(self, stdv):
-		pass
 
 
-	def _reparameterized_sample(self, mean, std):
-		"""using std to sample"""
-		eps = torch.FloatTensor(std.size()).normal_()
-		eps = Variable(eps)
-		return eps.mul(std).add_(mean)
 
 
-	def _kld_gauss(self, mean_1, std_1, mean_2, std_2):
-		"""Using std to compute KLD"""
-
-		kld_element =  (2 * torch.log(std_2) - 2 * torch.log(std_1) + 
-			(std_1.pow(2) + (mean_1 - mean_2).pow(2)) /
-			std_2.pow(2) - 1)
-		return	0.5 * torch.sum(kld_element)
 
 
-	def _nll_bernoulli(self, theta, x):
-		return - torch.sum(x*torch.log(theta) + (1-x)*torch.log(1-theta))
 
-
-	def _nll_gauss(self, mean, std, x):
-		pass
